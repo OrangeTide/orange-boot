@@ -3,5 +3,12 @@ CC=x86_64-w64-mingw32-gcc
 RM=del
 endif
 
+##
+
 all :: mkfloppy$X
 clean :: ; $(RM) mkfloppy$X
+
+##
+
+all :: hex$X
+clean :: ; $(RM) hex$X
