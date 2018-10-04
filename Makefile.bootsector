@@ -1,3 +1,4 @@
+# Makefile for 16-bit boot sector code
 CC=ia16-elf-gcc
 AS=ia16-elf-as
 LD=ia16-elf-ld
@@ -23,10 +24,3 @@ clean ::
 all :: hello.bin
 clean :: ; $(RM) hello.bin
 .PRECIOUS : hello.elf
-
-##
-
-all :: tools-all
-clean :: tools-clean
-tools-% :: ; $(MAKE) -f Makefile.tools $*
-# .PHONY : tools-clean tools-all
