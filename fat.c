@@ -14,6 +14,13 @@
 	(((uint32_t)((uint8_t*)(ptr))[2]) << 16) | \
 	(((uint32_t)((uint8_t*)(ptr))[3]) << 24))
 
+#define ATTR_READ_ONLY (1)
+#define ATTR_HIDDEN (2)
+#define ATTR_SYSTEM (4)
+#define ATTR_VOLUME_LABEL (8)
+#define ATTR_SUBDIR (16)
+#define ATTR_ARCHIVE (32)
+
 static FILE *imagef;
 static const char *imagefilename = "floppy.img";
 static uint8_t buf[512];
@@ -63,7 +70,7 @@ read_directory_entry(unsigned offset)
 		uint32_t size;
 	} ent;
 
-	if (offset + 32 >= 512) {
+	if (offset + 32 > 512) {
 		fprintf(stderr, "%s:offset exceeds sector size\n", imagefilename);
 		return -1;
 	}
@@ -77,11 +84,24 @@ read_directory_entry(unsigned offset)
 	ent.starting_cluster = READ_WORD(buf + offset + 0x1a);
 	ent.size = READ_DWORD(buf + offset + 0x1c);
 
-	if (ent.filename[0] & 0x80)
+	if (ent.filename[0] == 0 || ent.filename[0] == (char)0xe5)
 		return 0; /* deleted file - do not print ... */
 
 	// TODO: return the structure
-	printf("%06X:\t%.8s %.3s %12u\n", offset, ent.filename, ent.ext, ent.size);
+	printf("%06X:\t%.8s %.3s %c%c%c%c", offset, ent.filename, ent.ext,
+		ent.attr & ATTR_HIDDEN ? 'H' : '-',
+		ent.attr & ATTR_ARCHIVE ? 'A' : '-',
+		ent.attr & ATTR_READ_ONLY ? 'R' : '-',
+		ent.attr & ATTR_SYSTEM ? 'S' : '-');
+	if (ent.attr & ATTR_SUBDIR)
+		printf(" <DIR>       ");
+	else if (ent.attr & ATTR_VOLUME_LABEL)
+		printf(" <VOLUME>    ");
+	else
+		printf(" %12u", ent.size);
+
+	printf(" (first $%04X)\n",
+			ent.starting_cluster);
 
 	return 0;
 }
