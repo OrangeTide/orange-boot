@@ -8,11 +8,6 @@ endif
 
 ##
 
-all :: mkfloppy$X
-clean :: ; $(RM) mkfloppy$X
-
-##
-
 all :: hex$X
 clean :: ; $(RM) hex$X
 

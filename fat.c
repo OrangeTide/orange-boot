@@ -129,34 +129,84 @@ read_boot_block(void)
 		return -1;
 	}
 
+	/* This program only supports filesystems with 512 byte sectors. */
+	if (disk_info.bytes_per_block != 512) {
+		fprintf(stderr, "%s:block size %d not supported\n", imagefilename, disk_info.bytes_per_block);
+		return -1;
+	}
+
 	return 0;
 }
 
 static int
-read_root_directory(void)
+dir_sub_directory(int cluster)
 {
-	unsigned root_offset = disk_info.number_of_fats * disk_info.size_of_fat + disk_info.reserved_blocks;
-	unsigned i, offset;
+	unsigned sector;
 
-	fprintf(stderr, "INFO:root directory at block %06X, contains %u entries\n",
-		root_offset, disk_info.root_entries);
+	//
+	// TODO: look up chain of clusters in FAT
+	//
 
-	if (read_sector(root_offset))
+	abort();
+
+	if (read_sector(sector))
 		return -1;
 
-	/* loop through every directory entry */
-	offset = 0;
-	for (i = 0; i < disk_info.root_entries; i++) {
-		if (read_directory_entry(offset))
-			return -1;
-		offset += 32;
-		if (offset >= 512) {
-			offset = 0;
-			root_offset++;
-			if (read_sector(root_offset))
+	return 0;
+}
+
+/* state related to accessing directories */
+static unsigned current_directory_sector_origin;
+static unsigned current_directory_sector_i;
+static unsigned current_directory_entries;
+
+/* load the first root sector */
+static int
+root_directory_first(void)
+{
+	current_directory_sector_origin = disk_info.number_of_fats * disk_info.size_of_fat + disk_info.reserved_blocks;
+	current_directory_sector_i = 0;
+	current_directory_entries = disk_info.root_entries;
+
+	if (read_sector(current_directory_sector_origin))
+		return -1;
+
+	return 0;
+}
+
+/* continue loading next sector - return 0 when done, 1 to continue, and -1 on error */
+static int
+root_directory_next(void)
+{
+	if (current_directory_sector_i * 512 / 32 >= current_directory_entries)
+		return 0;
+
+	current_directory_sector_i++;
+	if (read_sector(current_directory_sector_origin + current_directory_sector_i))
+		return -1;
+
+	return 1;
+}
+
+static int
+dir_root_directory(void)
+{
+	int e;
+	unsigned i;
+	unsigned short offset;
+
+	if (root_directory_first())
+		return -1;
+
+	i = 0;
+	do {
+		for (offset = 0; offset < 512; offset += 32, i++) {
+			if (i >= current_directory_entries)
+				break;
+			if (read_directory_entry(offset))
 				return -1;
 		}
-	}
+	} while ((e = root_directory_next()) > 0);
 
 	return 0;
 }
@@ -171,6 +221,119 @@ open_image(void)
 		perror(imagefilename);
 		return -1;
 	}
+
+	return 0;
+}
+
+/* DIR */
+static int
+dir(const char *path)
+{
+	read_boot_block();
+
+	//
+	// TODO: parse path
+	//
+
+	if (dir_root_directory())
+		return -1;
+
+	return 0;
+}
+
+/* sector = 0, then use root directory */
+static unsigned
+lookup_file(unsigned sector, const char *filename)
+{
+
+	if (!sector) {
+		if (root_directory_first())
+			return -1;
+	}
+
+	// TODO: implement this
+	abort();
+}
+
+/* CAT or TYPE a file */
+static int
+cat(const char *path)
+{
+	read_boot_block();
+
+	abort(); // TODO: implement this
+
+	/* Step 1. find the file */
+	lookup_file(0, path);
+
+	return 0;
+}
+
+/* creates an empty image. open imagef for writing */
+static int
+make_image(unsigned size)
+{
+	unsigned long total;
+
+	if (!size)
+		size = 1440 * 1024;
+
+	imagef = fopen(imagefilename, "w+b");
+	if (!imagef) {
+		perror(imagefilename);
+		fclose(imagef);
+		return -1;
+	}
+
+	/* fill with zeros */
+	memset(buf, 0, sizeof(buf));
+	for (total = 0; total < size; total += sizeof(buf)) {
+		fwrite(buf, sizeof(buf), 1, imagef);
+		if (ferror(imagef)) {
+			perror(imagefilename);
+			return -1;
+		}
+	}
+
+	rewind(imagef);
+
+	return 0;
+}
+
+/* FORMAT */
+static int
+format(unsigned size, const char *bootloader)
+{
+	FILE *inf;
+
+	if (!imagef)
+		return -1; /* imagef must be opened for writing before calling this function */
+
+	inf = fopen(bootloader, "rb");
+	if (!inf) {
+		perror(bootloader);
+		return -1;
+	}
+
+	fseek(imagef, 0, SEEK_SET);
+
+	/* copy the boot sector */
+	while (fread(buf, sizeof(buf), 1, inf)) {
+		fwrite(buf, sizeof(buf), 1, imagef);
+		if (ferror(imagef)) {
+			perror(imagefilename);
+			fclose(inf);
+			return -1;
+		}
+	}
+
+	//
+	// TODO: generate a proper file-system structure
+	//
+
+	fprintf(stderr, "Successfully written %s\n", imagefilename);
+
+	fclose(inf);
 
 	return 0;
 }
@@ -194,6 +357,7 @@ main(int argc, char **argv)
 	while ((c = getopt(argc, argv, "ho:")) > 0) {
 		switch (c) {
 		case 'h':
+usage:
 			fprintf(stderr, "usage: fat [-h] [-o <filename>] [DIR|TYPE|COPY|REN|DEL] <args...> \n");
 			return 1;
 		case 'o':
@@ -202,25 +366,43 @@ main(int argc, char **argv)
 		}
 	}
 
-	if (open_image())
-		return 1;
+	if (optind == argc) {
+		if (open_image())
+			return 1;
 
-	// TODO: parse command-line arguments
-	for (i = optind; i < argc; i++) {
-		printf("TODO: argv[%d]=%s\n", i, argv[i]);
+		if (dir("/"))
+			goto failure;
+	} else if (strcasecmp(argv[optind], "DIR") == 0) {
+		if (open_image())
+			return 1;
+
+		for (i = optind; i < argc; i++) {
+			if (dir(argv[i]))
+				goto failure;
+		}
+	} else if (strcasecmp(argv[optind], "TYPE") == 0 || strcasecmp(argv[optind], "TYPE") == 0) {
+		const char *filename = optind + 1 < argc ? argv[optind + 1] : "README";
+
+		if (open_image())
+			return 1;
+
+		if (cat(filename))
+			goto failure;
+	} else if (strcasecmp(argv[optind], "FORMAT") == 0) {
+		unsigned size = 1440 * 1024;
+		const char *bootsectorfilename = "hello.bin";
+
+		if (make_image(size))
+			return -1;
+
+		if (format(size, bootsectorfilename))
+			goto failure;
+	} else {
+		for (i = optind; i < argc; i++) {
+			printf("TODO: argv[%d]=%s\n", i, argv[i]);
+		}
+		goto usage;
 	}
-
-	read_boot_block();
-
-	/* This program only supports filesystems with 512 byte sectors. */
-	if (disk_info.bytes_per_block != 512) {
-		fprintf(stderr, "%s:block size %d not supported\n", imagefilename, disk_info.bytes_per_block);
-		goto failure;
-	}
-
-	if (read_root_directory())
-		goto failure;
-
 	cleanup();
 
 	return 0;
