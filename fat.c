@@ -21,9 +21,21 @@
 #define ATTR_SUBDIR (16)
 #define ATTR_ARCHIVE (32)
 
+struct file_entry {
+	char filename[8]; // NOTE: not nul-terminated
+	char ext[3]; // NOTE: not nul-terminated
+	uint8_t attr;
+	uint8_t reserved[10];
+	uint16_t time;
+	uint16_t date;
+	uint16_t starting_cluster;
+	uint32_t size;
+};
+
 static FILE *imagef;
 static const char *imagefilename = "floppy.img";
 static uint8_t buf[512];
+// TODO: need 3 buffers. 1 fat, 1 directory, 1 data
 static struct {
 	unsigned bytes_per_block;
 	unsigned cluster_size; /* number of blocks per allocation unit */
@@ -45,8 +57,33 @@ read_sector(unsigned n)
 	return 0;
 }
 
+/* return -1 on error, 0 on deleted file, 1 on success */
 static int
-read_directory_entry(unsigned offset)
+read_directory_entry(unsigned offset, struct file_entry *ent)
+{
+	if (offset + 32 > 512) {
+		fprintf(stderr, "%s:offset exceeds sector size\n", imagefilename);
+		return -1;
+	}
+
+	memcpy(ent->filename, buf + offset + 0x00, 8);
+	memcpy(ent->ext, buf + offset + 0x08, 3);
+	ent->attr = READ_BYTE(buf + offset + 0x0b);
+	memcpy(ent->reserved, buf + offset + 0x0c, 10);
+	ent->time = READ_WORD(buf + offset + 0x16);
+	ent->date = READ_WORD(buf + offset + 0x18);
+	ent->starting_cluster = READ_WORD(buf + offset + 0x1a);
+	ent->size = READ_DWORD(buf + offset + 0x1c);
+
+	if (ent->filename[0] == 0 || ent->filename[0] == (char)0xe5)
+		return 0; /* deleted file - do not print ... */
+
+	return 1;
+}
+
+/* return -1 on error, 0 on success */
+static int
+print_directory_entry(unsigned offset)
 {
 	// 32-byte record:
 	// 0x00 8	filename
@@ -58,34 +95,15 @@ read_directory_entry(unsigned offset)
 	// 0x1A 2	starting cluster number
 	// 0x1C 4	file size (bytes)
 	//
+	struct file_entry ent;
+	int e;
 
-	struct file_entry {
-		char filename[8]; // NOTE: not nul-terminated
-		char ext[3]; // NOTE: not nul-terminated
-		uint8_t attr;
-		uint8_t reserved[10];
-		uint16_t time;
-		uint16_t date;
-		uint16_t starting_cluster;
-		uint32_t size;
-	} ent;
+	e = read_directory_entry(offset, &ent);
 
-	if (offset + 32 > 512) {
-		fprintf(stderr, "%s:offset exceeds sector size\n", imagefilename);
+	if (e < 0)
 		return -1;
-	}
-
-	memcpy(ent.filename, buf + offset + 0x00, 8);
-	memcpy(ent.ext, buf + offset + 0x08, 3);
-	ent.attr = READ_BYTE(buf + offset + 0x0b);
-	memcpy(ent.reserved, buf + offset + 0x0c, 10);
-	ent.time = READ_WORD(buf + offset + 0x16);
-	ent.date = READ_WORD(buf + offset + 0x18);
-	ent.starting_cluster = READ_WORD(buf + offset + 0x1a);
-	ent.size = READ_DWORD(buf + offset + 0x1c);
-
-	if (ent.filename[0] == 0 || ent.filename[0] == (char)0xe5)
-		return 0; /* deleted file - do not print ... */
+	else if (!e)
+		return 0;
 
 	// TODO: return the structure
 	printf("%06X:\t%.8s %.3s %c%c%c%c", offset, ent.filename, ent.ext,
@@ -203,7 +221,7 @@ dir_root_directory(void)
 		for (offset = 0; offset < 512; offset += 32, i++) {
 			if (i >= current_directory_entries)
 				break;
-			if (read_directory_entry(offset))
+			if (print_directory_entry(offset))
 				return -1;
 		}
 	} while ((e = root_directory_next()) > 0);
@@ -241,30 +259,106 @@ dir(const char *path)
 	return 0;
 }
 
-/* sector = 0, then use root directory */
+/* converts null terminated string into fixed size filename and extension */
+static int
+decode_filename(const char *filename, char rawname[8], char ext[3])
+{
+	unsigned n;
+
+	for (n = 0; filename[n]; n++)
+		if (filename[n] == '.') {
+			n++;
+			break;
+		}
+	// TODO: detect errors like truncation of filename
+
+	strncpy(rawname, filename, n > 8 ? 8 : n);
+	strncpy(ext, filename + n, 3);
+	for (n = 0; n < 8; n++)
+		if (!rawname[n])
+			rawname[n] = ' ';
+	for (n = 0; n < 3; n++)
+		if (!ext[n])
+			ext[n] = ' ';
+
+	return 0;
+}
+
+/* sector = 0, then use root directory.
+ * returns (unsigned)-1 on error or file not found.
+ */
 static unsigned
 lookup_file(unsigned sector, const char *filename)
 {
 
-	if (!sector) {
-		if (root_directory_first())
-			return -1;
+	unsigned i;
+	int e;
+	unsigned short offset;
+	struct file_entry ent;
+	char rawname[8], ext[3];
+
+	// TODO: decode path
+	if (decode_filename(filename, rawname, ext)) {
+		fprintf(stdout, "%s:illegal filename: %s\n", imagefilename, filename);
+		return ~0U;
 	}
 
-	// TODO: implement this
-	abort();
+	if (!sector) {
+		if (root_directory_first())
+			return ~0U;
+		i = 0;
+		do {
+			for (offset = 0; offset < 512; offset += 32, i++) {
+				if (i >= current_directory_entries)
+					break;
+				e = read_directory_entry(offset, &ent);
+				if (e < 0) {
+					fprintf(stdout, "%s:error reading at %d\n", imagefilename, offset);
+					return ~0U;
+				}
+				if (!e)
+					continue; /* deleted file - ignoring */
+				if (memcmp(ent.filename, rawname, 8) || memcmp(ent.ext, ext, 3))
+					continue; /* not a match */
+				// MATCH ...
+				//
+				fprintf(stdout, "%s:MATCH!\n", imagefilename);
+
+				return ent.starting_cluster;
+			}
+		} while ((e = root_directory_next()) > 0);
+
+		// TODO: check result (e) for errors
+
+		fprintf(stdout, "%s:File not found: %.8s.%.3s\n", imagefilename, rawname, ext);
+		return ~0U; /* not found */
+	} else {
+		// TODO: implement this
+
+		return ~0U; /* not found */
+	}
 }
 
 /* CAT or TYPE a file */
 static int
 cat(const char *path)
 {
+	unsigned cluster, sector, i;
+
 	read_boot_block();
 
-	abort(); // TODO: implement this
-
 	/* Step 1. find the file */
-	lookup_file(0, path);
+	cluster = lookup_file(0, path);
+
+	fprintf(stderr, "%s:first cluster $%04X\n", path, cluster);
+
+	// TODO: perform the right calculation here...
+	sector = (cluster - 2) * disk_info.cluster_size + 2;
+	for (i = 0; i < disk_info.cluster_size; i++) {
+		if (read_sector(sector + i))
+			return -1;
+		// TODO: implement decoding of FAT and output of sectors
+	}
 
 	return 0;
 }
@@ -359,6 +453,8 @@ main(int argc, char **argv)
 		case 'h':
 usage:
 			fprintf(stderr, "usage: fat [-h] [-o <filename>] [DIR|TYPE|COPY|REN|DEL] <args...> \n");
+			fprintf(stderr, "        DIR [<filename>]\n");
+			fprintf(stderr, "        TYPE <filename>\n");
 			return 1;
 		case 'o':
 			imagefilename = optarg;
@@ -380,8 +476,13 @@ usage:
 			if (dir(argv[i]))
 				goto failure;
 		}
-	} else if (strcasecmp(argv[optind], "TYPE") == 0 || strcasecmp(argv[optind], "TYPE") == 0) {
-		const char *filename = optind + 1 < argc ? argv[optind + 1] : "README";
+	} else if (strcasecmp(argv[optind], "TYPE") == 0 || strcasecmp(argv[optind], "CAT") == 0) {
+		const char *filename;
+
+		if (optind + 1 >= argc)
+			goto usage;
+
+		filename = argv[optind + 1];
 
 		if (open_image())
 			return 1;
